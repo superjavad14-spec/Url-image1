@@ -5,9 +5,10 @@
 نحوه استفاده:
     python extract_images.py <URL>
 
-رفتار:
+ویژگی‌ها:
     - اعتبارسنجی آدرس
     - دریافت صفحه با شبیه‌سازی مرورگر
+    - پشتیبانی از تلاش مجدد در صورت timeout
     - پارس HTML و استخراج src تگ‌های img
     - حذف data URI ها و لینک‌های تکراری
     - تبدیل لینک‌های نسبی به مطلق
@@ -15,6 +16,7 @@
 """
 
 import sys
+import time
 import urllib.parse
 from typing import List, Optional
 
@@ -38,8 +40,12 @@ HEADERS = {
         "Chrome/125.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Connection": "keep-alive",
 }
-REQUEST_TIMEOUT = 15  # ثانیه
+REQUEST_TIMEOUT = 30          # ثانیه (افزایش‌یافته برای کاهش احتمال timeout)
+MAX_RETRIES = 3               # تعداد تلاش‌های مجاز در صورت timeout
+RETRY_BACKOFF = 2.0           # ثانیه تأخیر بین تلاش‌ها
 OUTPUT_FILE = "links.txt"
 
 # ------------------------------------------------------------------------------
@@ -62,45 +68,90 @@ def validate_url(raw_url: str) -> str:
     return raw_url
 
 
-def fetch_page(url: str, session: requests.Session) -> requests.Response:
+def fetch_page(
+    url: str,
+    session: requests.Session,
+    retries: int = MAX_RETRIES,
+    backoff: float = RETRY_BACKOFF,
+) -> requests.Response:
     """
-    دریافت صفحه با مدیریت خطاهای شبکه و زمان.
-    خروجی response را برمی‌گرداند.
+    دریافت صفحه با مدیریت خطاهای شبکه، timeout و تلاش مجدد.
+
+    Args:
+        url: آدرس کامل صفحه
+        session: نشست requests برای استفاده مجدد از اتصال
+        retries: تعداد تلاش‌های مجاز (پیش‌فرض 3)
+        backoff: ضریب تأخیر بین تلاش‌ها (ثانیه)
+
+    Returns:
+        شیء requests.Response در صورت موفقیت
+
+    Raises:
+        SystemExit: در صورت شکست تمام تلاش‌ها یا خطاهای غیرقابل بازیابی
     """
-    try:
-        response = session.get(
-            url,
-            headers=HEADERS,
-            timeout=REQUEST_TIMEOUT,
-            allow_redirects=True,
-        )
-    except requests.exceptions.Timeout:
-        print(f"خطا: درخواست به '{url}' با timeout مواجه شد.", file=sys.stderr)
-        sys.exit(1)
-    except requests.exceptions.TooManyRedirects:
-        print(f"خطا: تعداد تغییر مسیرهای '{url}' بیش از حد مجاز است.", file=sys.stderr)
-        sys.exit(1)
-    except requests.exceptions.ConnectionError as e:
-        print(f"خطا: اتصال به '{url}' برقرار نشد: {e}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"خطای ناشناخته در دریافت صفحه: {e}", file=sys.stderr)
-        sys.exit(1)
+    last_exception: Optional[Exception] = None
 
-    if response.status_code != 200:
-        print(
-            f"خطا: سرور برای '{url}' کد وضعیت {response.status_code} "
-            f"را برگرداند. (منتظر 200 بود)",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+    for attempt in range(1, retries + 1):
+        try:
+            response = session.get(
+                url,
+                headers=HEADERS,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+            )
 
-    return response
+            # اگر کد وضعیت 200 باشد، بلافاصله برمی‌گردانیم
+            if response.status_code == 200:
+                return response
+
+            # ---- کدهای وضعیت غیر 200 (به جز timeout) معمولاً با retry حل نمی‌شوند ----
+            print(
+                f"خطا: سرور برای '{url}' کد وضعیت {response.status_code} "
+                f"برگرداند. (منتظر 200 بود)",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        except requests.exceptions.Timeout as e:
+            last_exception = e
+            print(
+                f"تلاش {attempt}/{retries} با timeout مواجه شد. "
+                f"در حال انتظار {backoff} ثانیه...",
+                file=sys.stderr,
+            )
+            time.sleep(backoff)
+
+        except requests.exceptions.TooManyRedirects as e:
+            print(
+                f"خطا: تعداد تغییر مسیرهای '{url}' بیش از حد مجاز است.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        except requests.exceptions.ConnectionError as e:
+            print(
+                f"خطا: اتصال به '{url}' برقرار نشد: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        except Exception as e:
+            # خطاهای ناشناخته
+            print(f"خطای ناشناخته در دریافت صفحه: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    # اگر همه تلاش‌ها صرفاً timeout شدند
+    print(
+        f"خطا: پس از {retries} تلاش، درخواست به '{url}' همچنان timeout است.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def extract_image_urls(html: str, base_url: str) -> List[str]:
     """
     پارس HTML و استخراج لینک‌های مطلق تصاویر.
+
     - لینک‌های data: رد می‌شوند.
     - لینک‌های تکراری حذف می‌شوند (با حفظ ترتیب).
     - srcهای خالی یا ناموجود نادیده گرفته می‌شوند.
@@ -153,7 +204,7 @@ def main() -> None:
 
     session = requests.Session()
 
-    # دریافت صفحه (آدرس نهایی پس از redirectها در response.url ذخیره می‌شود)
+    # دریافت صفحه با تلاش مجدد (آدرس نهایی پس از redirectها در response.url موجود است)
     response = fetch_page(validated_url, session)
 
     # استخراج تصاویر با استفاده از آدرس نهایی
