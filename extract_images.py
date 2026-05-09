@@ -8,7 +8,7 @@
 ویژگی‌ها:
     - اعتبارسنجی آدرس
     - دریافت صفحه با شبیه‌سازی مرورگر
-    - پشتیبانی از تلاش مجدد در صورت timeout
+    - پشتیبانی از تلاش مجدد در صورت timeout یا خطاهای 5xx (شامل 522 Cloudflare)
     - پارس HTML و استخراج src تگ‌های img
     - حذف data URI ها و لینک‌های تکراری
     - تبدیل لینک‌های نسبی به مطلق
@@ -43,9 +43,9 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Connection": "keep-alive",
 }
-REQUEST_TIMEOUT = 30          # ثانیه (افزایش‌یافته برای کاهش احتمال timeout)
-MAX_RETRIES = 3               # تعداد تلاش‌های مجاز در صورت timeout
-RETRY_BACKOFF = 2.0           # ثانیه تأخیر بین تلاش‌ها
+REQUEST_TIMEOUT = 45          # ثانیه (افزایش برای تحمل کندی سرور)
+MAX_RETRIES = 3               # تعداد تلاش‌های مجاز
+RETRY_BACKOFF = 5.0           # ثانیه تأخیر بین تلاش‌ها
 OUTPUT_FILE = "links.txt"
 
 # ------------------------------------------------------------------------------
@@ -75,22 +75,20 @@ def fetch_page(
     backoff: float = RETRY_BACKOFF,
 ) -> requests.Response:
     """
-    دریافت صفحه با مدیریت خطاهای شبکه، timeout و تلاش مجدد.
+    دریافت صفحه با مدیریت خطاهای شبکه، timeout، کدهای 5xx (مانند 522 Cloudflare) و تلاش مجدد.
 
     Args:
         url: آدرس کامل صفحه
-        session: نشست requests برای استفاده مجدد از اتصال
-        retries: تعداد تلاش‌های مجاز (پیش‌فرض 3)
-        backoff: ضریب تأخیر بین تلاش‌ها (ثانیه)
+        session: نشست requests
+        retries: تعداد کل تلاش‌ها
+        backoff: تأخیر بین تلاش‌ها (ثانیه)
 
     Returns:
-        شیء requests.Response در صورت موفقیت
+        requests.Response در صورت موفقیت نهایی
 
     Raises:
-        SystemExit: در صورت شکست تمام تلاش‌ها یا خطاهای غیرقابل بازیابی
+        SystemExit: اگر تمام تلاش‌ها شکست بخورد
     """
-    last_exception: Optional[Exception] = None
-
     for attempt in range(1, retries + 1):
         try:
             response = session.get(
@@ -100,28 +98,37 @@ def fetch_page(
                 allow_redirects=True,
             )
 
-            # اگر کد وضعیت 200 باشد، بلافاصله برمی‌گردانیم
+            # ---- موفقیت ----
             if response.status_code == 200:
                 return response
 
-            # ---- کدهای وضعیت غیر 200 (به جز timeout) معمولاً با retry حل نمی‌شوند ----
+            # ---- خطاهای 5xx (موقتی) - شامل 522 Cloudflare - تلاش مجدد ----
+            if response.status_code >= 500:
+                print(
+                    f"تلاش {attempt}/{retries}: کد وضعیت {response.status_code} "
+                    f"(خطای سرور). در انتظار {backoff} ثانیه...",
+                    file=sys.stderr,
+                )
+                time.sleep(backoff)
+                continue  # تلاش بعدی
+
+            # ---- سایر کدهای غیر 200 - خطای غیرقابل بازیابی ----
             print(
-                f"خطا: سرور برای '{url}' کد وضعیت {response.status_code} "
-                f"برگرداند. (منتظر 200 بود)",
+                f"خطا: سرور برای '{url}' کد وضعیت {response.status_code} برگرداند. "
+                f"(منتظر 200 بود)",
                 file=sys.stderr,
             )
             sys.exit(1)
 
-        except requests.exceptions.Timeout as e:
-            last_exception = e
+        except requests.exceptions.Timeout:
             print(
                 f"تلاش {attempt}/{retries} با timeout مواجه شد. "
-                f"در حال انتظار {backoff} ثانیه...",
+                f"در انتظار {backoff} ثانیه...",
                 file=sys.stderr,
             )
             time.sleep(backoff)
 
-        except requests.exceptions.TooManyRedirects as e:
+        except requests.exceptions.TooManyRedirects:
             print(
                 f"خطا: تعداد تغییر مسیرهای '{url}' بیش از حد مجاز است.",
                 file=sys.stderr,
@@ -136,13 +143,12 @@ def fetch_page(
             sys.exit(1)
 
         except Exception as e:
-            # خطاهای ناشناخته
             print(f"خطای ناشناخته در دریافت صفحه: {e}", file=sys.stderr)
             sys.exit(1)
 
-    # اگر همه تلاش‌ها صرفاً timeout شدند
+    # اگر به اینجا برسیم یعنی همه retry ها تمام شده
     print(
-        f"خطا: پس از {retries} تلاش، درخواست به '{url}' همچنان timeout است.",
+        f"خطا: پس از {retries} تلاش، دریافت '{url}' موفق نبود.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -204,10 +210,10 @@ def main() -> None:
 
     session = requests.Session()
 
-    # دریافت صفحه با تلاش مجدد (آدرس نهایی پس از redirectها در response.url موجود است)
+    # دریافت صفحه با تلاش مجدد
     response = fetch_page(validated_url, session)
 
-    # استخراج تصاویر با استفاده از آدرس نهایی
+    # استخراج تصاویر
     image_links = extract_image_urls(response.text, response.url)
 
     if not image_links:
